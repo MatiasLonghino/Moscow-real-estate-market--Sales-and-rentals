@@ -733,3 +733,204 @@ def predecir_paquete(datos, paquete, transformadores):
     if not (np.isfinite(pred) & (pred > 0)).all():
         raise ValueError("Predicción fuera del dominio inverso Box-Cox; no se recorta.")
     return pred
+
+
+COLORES_SEGMENTOS = dict(zip(SEGMENTOS, ['#1f77b4','#2ca02c','#ff7f0e','#d62728']))
+VERSION_DIAGNOSTICO_TEST = 'residuos-test-scale-qq-v3'
+
+
+def diagnosticar_test_bss(modelos, test, parametros, evaluaciones, predicciones=None):
+    """Errores fuera de muestra; escala residual aprendida solo en train.
+
+    LOWESS describe los datos, no ajusta el modelo OLS ni cambia su selección.
+    No se centran los residuos de test ni se studentizan con leverage de test.
+    """
+    from statsmodels.nonparametric.smoothers_lowess import lowess
+    if set(modelos) != set(SEGMENTOS):
+        raise ValueError('Se requieren los cuatro modelos BSS definitivos.')
+    etiquetas = segmentos(test.to_center_km, parametros['cuartiles_distancia_km'])
+    diagnosticos, tablas = {}, {}
+    for s in SEGMENTOS:
+        modelo=modelos[s]; datos=test.loc[etiquetas.eq(s)].copy()
+        lam=float(parametros['lambda_por_segmento'][s])
+        assert datos.index.is_unique and len(datos)>0
+        M=diseno(datos, modelo.model.exog_names)
+        pred_bc=np.asarray(modelo.predict(M),dtype=float)
+        assert np.isfinite(pred_bc).all()
+        if lam != 0:
+            assert (1+lam*pred_bc>0).all(), 'Inversa Box-Cox fuera de dominio; no se recorta.'
+        pred_rub=inv_boxcox(pred_bc,lam)
+        assert np.isfinite(pred_rub).all() and (pred_rub>0).all()
+        if predicciones is not None:
+            previo=predicciones[s]
+            pd.testing.assert_index_equal(previo.index,datos.index)
+            np.testing.assert_array_equal(pred_bc,previo.pred_boxcox.to_numpy())
+            np.testing.assert_array_equal(pred_rub,previo.pred_price_rub.to_numpy())
+        met=errores(datos.price_rub,pred_rub)
+        ref=evaluaciones[s]['test_RUB']
+        for nombre,clave in [('r2_rub','R2'),('mae_rub','MAE'),('rmse_rub','RMSE')]:
+            np.testing.assert_allclose(met[nombre],ref[clave],rtol=1e-11,atol=1e-8)
+        sigma=float(np.sqrt(modelo.mse_resid))
+        assert np.isfinite(sigma) and sigma>0 and modelo.df_resid>0
+        np.testing.assert_allclose(sigma**2,np.sum(np.asarray(modelo.resid)**2)/modelo.df_resid,rtol=1e-12)
+        residuo_rub=datos.price_rub.to_numpy()-pred_rub
+        real_bc=boxcox(datos.price_rub.to_numpy(dtype=float),lmbda=lam)
+        residuo_bc=real_bc-pred_bc
+        z=residuo_bc/sigma
+        d=pd.DataFrame({'price_rub':datos.price_rub,'pred_price_rub':pred_rub,
+            'residuo_rub':residuo_rub,'price_boxcox':real_bc,'pred_boxcox':pred_bc,
+            'residuo_boxcox':residuo_bc,'residuo_escalado_train':z,'scale_location':np.sqrt(np.abs(z))},index=datos.index)
+        assert len(d)==len(datos) and np.isfinite(d.to_numpy()).all()
+        curvas={}
+        for clave,x,y in [('rub',d.pred_price_rub,d.residuo_rub),('scale',d.pred_boxcox,d.scale_location)]:
+            curvas[clave]=lowess(y,x,frac=.35,it=3,delta=0,missing='raise',return_sorted=True)
+            assert len(curvas[clave])==len(d) and np.isfinite(curvas[clave]).all()
+        d.attrs.update(segmento=s,lambda_boxcox=lam,sigma_train_boxcox=sigma,n_train=int(modelo.nobs),
+                       lowess_frac=.35,lowess_it=3,curvas=curvas,version=VERSION_DIAGNOSTICO_TEST)
+        tablas[s]=pd.DataFrame({'Indicador':['Observaciones evaluadas','Media de residuos (RUB)',
+            'Mediana de residuos (RUB)','Desviación estándar residual (RUB)','MAE test (RUB)',
+            'RMSE test (RUB)','R² test (RUB)','Porcentaje de residuos positivos','Porcentaje de residuos negativos'],
+            'Valor':[len(d),d.residuo_rub.mean(),d.residuo_rub.median(),d.residuo_rub.std(ddof=1),
+                     ref['MAE'],ref['RMSE'],ref['R2'],100*d.residuo_rub.gt(0).mean(),100*d.residuo_rub.lt(0).mean()]})
+        diagnosticos[s]=d
+    indices=pd.Index(np.concatenate([d.index.to_numpy() for d in diagnosticos.values()]))
+    assert len(indices)==len(test) and indices.is_unique and set(indices)==set(test.index)
+    return diagnosticos,tablas
+
+
+def _panel_diagnostico_test(ax,datos,tipo):
+    from matplotlib.ticker import FuncFormatter,MaxNLocator,ScalarFormatter
+    s=datos.attrs['segmento']; color=COLORES_SEGMENTOS[s]
+    if tipo=='rub':
+        x,y=datos.pred_price_rub,datos.residuo_rub
+        ax.axhline(0,color='#555555',linestyle='--',linewidth=1)
+        ax.set(xlabel='Precio predicho por BSS (RUB)',ylabel='Residuo: real − predicho (RUB)',
+               title=f'{s} — Residuals vs Fitted | test n={len(datos):,}')
+        for eje in [ax.xaxis,ax.yaxis]:
+            eje.set_major_formatter(FuncFormatter(lambda v,pos:f'{v:,.0f}'.replace(',','.')))
+    elif tipo=='scale':
+        x,y=datos.pred_boxcox,datos.scale_location
+        ax.set(xlabel=f'Valor ajustado (Box-Cox; λ={datos.attrs["lambda_boxcox"]:.4f})',
+               ylabel='√|residuo Box-Cox / σ de train|',
+               title=f'{s} — Scale–Location | escala residual de train')
+        ax.xaxis.set_major_formatter(ScalarFormatter(useOffset=False))
+    elif tipo=='qq':
+        from scipy.stats import norm
+        # Una posición por observación; sin centrar ni reescalar con test.
+        y=np.sort(datos.residuo_escalado_train.to_numpy())
+        x=norm.ppf((np.arange(len(y))+.5)/len(y))
+        ax.scatter(x,y,s=12,alpha=.30,color=color,edgecolors='none',rasterized=True)
+        inferior=min(x.min(),y.min());superior=max(x.max(),y.max())
+        margen=.05*(superior-inferior)
+        limites=(inferior-margen,superior+margen)
+        ax.plot(limites,limites,color='black',linestyle='--',linewidth=1.5,label='Normal estándar: y = x')
+        ax.set(xlabel='Cuantiles teóricos N(0, 1)',ylabel='Cuantiles de e(test, Box-Cox) / σ de train',
+               title=f'{s} — Normal Q-Q | test n={len(datos):,}',xlim=limites,ylim=limites)
+        ax.set_aspect('equal',adjustable='box')
+        ax.xaxis.set_major_locator(MaxNLocator(5));ax.yaxis.set_major_locator(MaxNLocator(5))
+        ax.legend(loc='best',fontsize=8)
+        return
+    else:
+        raise ValueError('Tipo de diagnóstico desconocido.')
+    ax.scatter(x,y,s=12,alpha=.30,color=color,edgecolors='none',rasterized=True)
+    curva=datos.attrs['curvas'][tipo]
+    ax.plot(curva[:,0],curva[:,1],color='black',linewidth=2,label='LOWESS (frac=0,35)')
+    ax.xaxis.set_major_locator(MaxNLocator(5));ax.yaxis.set_major_locator(MaxNLocator(5))
+    ax.legend(loc='best',fontsize=8)
+
+
+def figura_residuos_test(diagnosticos, segmentos_mostrar=None, tipo=None):
+    """Scale-Location y Q-Q: figura 4×2 y paneles individuales remotos."""
+    import matplotlib.pyplot as plt
+    nombres=SEGMENTOS if segmentos_mostrar is None else list(segmentos_mostrar)
+    tipos=['scale','qq'] if tipo is None else [tipo]
+    with plt.style.context('ggplot'), plt.rc_context({'font.family':'DejaVu Sans','font.size':10,
+            'axes.titlesize':12,'axes.labelsize':10,'xtick.labelsize':9,'ytick.labelsize':9,
+            'figure.dpi':100,'savefig.dpi':120,'figure.autolayout':False}):
+        fig,axes=plt.subplots(len(nombres),len(tipos),figsize=(9*len(tipos),4.5*len(nombres)),squeeze=False)
+        for i,s in enumerate(nombres):
+            for j,t in enumerate(tipos):_panel_diagnostico_test(axes[i,j],diagnosticos[s],t)
+        fig.tight_layout(pad=2.0,h_pad=3.0,w_pad=2.0)
+    return fig
+
+
+def _archivos_diagnosticos_test(diagnosticos,tablas):
+    """Exporta los dos diagnósticos visibles sin alterar artefactos históricos."""
+    import matplotlib.pyplot as plt
+    archivos={s:{} for s in SEGMENTOS}
+    for s in SEGMENTOS:
+        for tipo,nombre in [('scale','scale_location_test.png'),('qq','normal_qq_test.png')]:
+            fig=figura_residuos_test(diagnosticos,[s],tipo)
+            b=io.BytesIO();fig.savefig(b,format='png',dpi=120);plt.close(fig)
+            archivos[s][nombre]=b.getvalue()
+    fig=figura_residuos_test(diagnosticos);b=io.BytesIO();fig.savefig(b,format='png',dpi=120);plt.close(fig)
+    archivos[SEGMENTOS[0]]['comparativa_test_4x2.png']=b.getvalue()
+    return archivos
+
+
+def registrar_diagnosticos_test(raiz,modelos,diagnosticos,tablas,cliente=None,progreso=print):
+    """Anexa artefactos a runs terminados; no crea runs ni cambia sus métricas.
+
+    Reutiliza el registro/verificación de Fase 1. Cada archivo existente se
+    descarga y compara antes de escribir; solo se suben nombres ausentes.
+    Una colisión de contenido detiene el proceso antes de la primera subida.
+    """
+    raiz=Path(raiz).resolve()
+    if str(raiz) not in sys.path:sys.path.insert(0,str(raiz))
+    from Ventas.Fase1_PropUsadas.scripts.almacenamiento_mlflow import registrar_archivos
+    cliente=conectar(raiz) if cliente is None else cliente
+    exp=cliente.get_experiment_by_name(EXPERIMENTO)
+    if exp is None:raise ConflictoRegistro('Debe existir Fase2_PropUsadas.')
+    archivos=_archivos_diagnosticos_test(diagnosticos,tablas)
+    planes=[]
+    with TemporaryDirectory(prefix='moscow_residuos_test_') as tmp:
+        temporal=Path(tmp)
+        for s in SEGMENTOS:
+            nombre='F2_08_BSS_GVIF_'+s.title().replace(' ','_')
+            candidatos=_buscar_runs(cliente,exp.experiment_id,f"tags.fase2_base = '{nombre}'")
+            candidatos=[r for r in candidatos if r.info.status=='FINISHED']
+            if len(candidatos)!=1:raise ConflictoRegistro(f'Run GVIF ambiguo o ausente: {nombre}')
+            run=candidatos[0];rid=run.info.run_id
+            descarga=temporal/(s.replace(' ','_')+'_descarga');descarga.mkdir()
+            paquete=joblib.load(cliente.download_artifacts(rid,'modelo_segmento.joblib',str(descarga)))
+            np.testing.assert_array_equal(paquete['modelo'].params,modelos[s].params)
+            assert paquete['contrato']['columnas_diseno']==modelos[s].model.exog_names
+            assert paquete['contrato']['boxcox_lambda']==diagnosticos[s].attrs['lambda_boxcox']
+            assert int(run.data.params['n_test'])==len(diagnosticos[s])
+            met=errores(diagnosticos[s].price_rub,diagnosticos[s].pred_price_rub)
+            for k,v in met.items():np.testing.assert_allclose(run.data.metrics['test_'+k],v,rtol=1e-10,atol=1e-8)
+            huella=sha(json_bytes({'version':VERSION_DIAGNOSTICO_TEST,'modelo':np.asarray(modelos[s].params),
+                'lambda':diagnosticos[s].attrs['lambda_boxcox'],'sigma_train':diagnosticos[s].attrs['sigma_train_boxcox'],
+                'datos':sha(pd.util.hash_pandas_object(diagnosticos[s],index=True).to_numpy().tobytes()),
+                'lowess_frac':.35,'lowess_it':3,'matplotlib':version('matplotlib')}))[:16]
+            destino=f'diagnosticos_test/{VERSION_DIAGNOSTICO_TEST}_{huella}'
+            try:
+                existentes={p.path:p for p in cliente.list_artifacts(rid,destino)}
+            except Exception as exc:
+                if getattr(exc,'error_code',None)!='RESOURCE_DOES_NOT_EXIST':raise
+                existentes={}
+            faltantes={}
+            for fichero,contenido in archivos[s].items():
+                ruta=destino+'/'+fichero
+                if ruta in existentes:
+                    recibido=Path(cliente.download_artifacts(rid,ruta,str(descarga)))
+                    if sha(recibido.read_bytes())!=sha(contenido):
+                        raise ConflictoRegistro(f'Artefacto existente con otro contenido: {ruta}')
+                else:faltantes[fichero]=contenido
+            planes.append((s,run,destino,faltantes))
+        # Todos los runs, contratos y nombres se validan antes de publicar.
+        filas=[]
+        for s,antes,destino,faltantes in planes:
+            rid=antes.info.run_id
+            progreso(f'{s}: {len(faltantes)} artefactos nuevos de residuos de test',flush=True)
+            if faltantes:
+                salida=temporal/s.replace(' ','_');salida.mkdir()
+                for nombre,contenido in faltantes.items():(salida/nombre).write_bytes(contenido)
+                registrar_archivos(cliente,rid,salida,destino)
+            despues=cliente.get_run(rid)
+            assert despues.info.status==antes.info.status=='FINISHED'
+            assert despues.data.params==antes.data.params and despues.data.metrics==antes.data.metrics
+            assert despues.data.tags==antes.data.tags
+            filas.append({'Segmento':s,'Run ID':rid,'Estado':'Añadidos y verificados' if faltantes else 'Reutilizados y verificados',
+                          'Artefactos nuevos':len(faltantes),'Carpeta remota':destino})
+    return pd.DataFrame(filas)
