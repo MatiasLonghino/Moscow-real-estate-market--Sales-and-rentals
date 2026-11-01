@@ -27,7 +27,7 @@ def test_limpieza_al_finalizar_y_ante_interrupcion():
 
 def test_rechaza_artefactos_permanentes():
     with pytest.raises(ValueError):
-        validar_temporal(RAIZ / 'Ventas/Propiedades_Usadas/resultados')
+        validar_temporal(RAIZ / 'Ventas/Fase1_PropUsadas/resultados')
 
 
 def test_ejecucion_forward_libera_temporales_si_falla_la_preparacion(monkeypatch):

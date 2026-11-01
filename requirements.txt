@@ -10,3 +10,7 @@ scikit-learn
 statsmodels
 kagglehub
 jinja2
+joblib
+threadpoolctl
+python-dotenv
+mlflow-skinny

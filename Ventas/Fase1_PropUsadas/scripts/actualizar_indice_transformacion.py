@@ -47,7 +47,7 @@ def actualizar_indice(notebook):
     indices[0]["source"] = [
         '<a id="indice"></a>\n', "\n", "## Índice\n", "\n", *enlaces, "\n",
         "Actualizar después de agregar, eliminar, renombrar o mover secciones: "
-        "`python Ventas/Propiedades_Usadas/scripts/actualizar_indice_transformacion.py` "
+        "`python Ventas/Fase1_PropUsadas/scripts/actualizar_indice_transformacion.py` "
         "desde la raíz del proyecto. `--check` verifica la sincronización sin escribir.\n",
     ]
 

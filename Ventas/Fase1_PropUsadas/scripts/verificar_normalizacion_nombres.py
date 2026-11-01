@@ -38,7 +38,7 @@ def verificar(raiz):
     from . import baseline_ols as b
     from .almacenamiento_mlflow import SesionTemporal, RUN_TRANSFORMACION
     from .contrato_datasets import CONTRATO, ruta_dataset
-    carpeta = Path(raiz) / "Ventas/Propiedades_Usadas"
+    carpeta = Path(raiz) / "Ventas/Fase1_PropUsadas"
     cliente = b.conectar(raiz)
     with SesionTemporal() as sesion:
         temporal = sesion.carpeta("verificacion")

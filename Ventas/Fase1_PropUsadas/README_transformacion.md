@@ -21,7 +21,7 @@ huellas; que el módulo actual tenga otro hash no invalida los CSV congelados.
 ```python
 from pathlib import Path
 import sys
-base = Path("Ventas/Propiedades_Usadas").resolve()
+base = Path("Ventas/Fase1_PropUsadas").resolve()
 sys.path.insert(0, str(base))
 from scripts import baseline_ols as b
 X_train, y_train, contexto = b.cargar_train(base)
